@@ -4,6 +4,31 @@
 
 A pure Fronted, children styled SQL learning environment.
 
+## Version 1.0.0 更新 2025.08.15
+
+### 🚀 核心功能扩展
+- **SQL 引擎升级**
+  - 新增 `UPDATE` 语句支持（`SET col = expr`、`SET col = col + 1` 等，支持 `WHERE` 条件）。
+  - 错误提示信息扩展为：`CREATE / INSERT / SELECT / UPDATE`。
+  - 删除未使用的 `evalHaving()` 方法，精简代码。
+  - 增强 `SELECT` 支持：可解析 `AS` 别名、`COUNT(*)`、`AVG()`、`GROUP BY`、`ORDER BY` 等。
+
+- **数据录入与建表联动**
+  - 将“加数据”模块与“创建表”模块合并，字段变化和 SQL 预览实时同步。
+  - 支持批量添加多行数据，并实时生成 `INSERT` 语句。
+  - 仅在表已创建的情况下允许插入数据。
+
+### 🎨 UI 与布局优化
+- **布局调整**
+  - 调整 `SampleDB` 与 `ResultTable` 高度一致，避免大块空白。
+  - `ResultTable` 自适应 `minHeight`，确保至少 10 行数据无需滚动。
+  - 调整 CSS，避免内容溢出。
+
+- **交互优化**
+  - 查询区字体放大，突出 SQL 语句。
+  - `PlayLab` 初始不显示数据表。
+  - `maxRows` 自动与数据行数同步。
+
 ## 功能概述
 
 本模拟器分为两个主要页面：
