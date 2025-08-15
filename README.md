@@ -99,5 +99,3 @@ HAVING cnt > 1;
 - 积木式 SELECT / JOIN 组装器
 - 本地存储保存/加载数据库
 - 导出 CSV / SQL 脚本
-
-# VERSION 0.0.1
