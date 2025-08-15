@@ -120,19 +120,55 @@ function makeExamples(db: Database, table: string, override?: Schema) {
   const cName = cols[0]?.name || 'id';
   const c2 = cols[1]?.name || cols[0]?.name || 'id';
   const numCol = cols.find(isNumericCol)?.name || c2;
+  const txtCol = cols.find(isTextCol)?.name || c2;
 
   const list: { name: string; sql: string; hint?: string }[] = [];
 
+  // 基础
   list.push({ name: '查全部', sql: `SELECT * FROM ${table};` });
   list.push({ name: '挑字段', sql: `SELECT ${[cName, c2].filter(Boolean).join(', ')} FROM ${table};` });
   list.push({ name: '条件 AND/OR', sql: `SELECT * FROM ${table} WHERE ${cName} = ${mockLiteral(cols[0]) || 1} OR ${c2} LIKE '%a%';`, hint: '支持 AND / OR / 括号 / LIKE / 比较' });
   list.push({ name: '排序多列', sql: `SELECT * FROM ${table} ORDER BY ${numCol} DESC, ${cName} ASC;` });
+
+  // DISTINCT
+  list.push({ name: 'DISTINCT', sql: `SELECT DISTINCT ${c2} FROM ${table} ORDER BY ${c2};`, hint: '去重后再排序' });
 
   // GROUP BY：选择一个非空列分组 + 可选聚合
   list.push({
     name: 'GROUP BY',
     sql: `SELECT ${c2} AS k, COUNT(*) AS cnt${numCol ? `, AVG(${numCol}) AS avg_v` : ''} FROM ${table} GROUP BY ${c2} ORDER BY cnt DESC;`,
   });
+
+  // 取样当前表的值用于 IN/BETWEEN 示例
+  const rows: any[] = ((db.rows as any)[table] as any[]) || [];
+  const pickVals = sampleValues(rows, c2, 2);
+  const pickNums = numCol ? sampleValues(rows, numCol, 2).map(Number).filter(n => !Number.isNaN(n)) : [];
+
+  // IN / NOT IN（优先使用真实值样本）
+  if (c2) {
+    const inList = (pickVals.length ? pickVals : [mockLiteral(cols[1] || cols[0], 1), mockLiteral(cols[1] || cols[0], 2)])
+      .map(v => (typeof v === 'string' && !/^'.*'$/.test(v) ? `'${v}'` : String(v)))
+      .join(', ');
+    list.push({ name: 'IN', sql: `SELECT * FROM ${table} WHERE ${c2} IN (${inList});` });
+    list.push({ name: 'NOT IN', sql: `SELECT * FROM ${table} WHERE ${c2} NOT IN (${inList});` });
+  }
+
+  // BETWEEN（数值列优先，找两端范围）
+  if (numCol) {
+    const a = pickNums[0] ?? 10;
+    const b = pickNums[1] ?? 50;
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    list.push({ name: 'BETWEEN', sql: `SELECT * FROM ${table} WHERE ${numCol} BETWEEN ${lo} AND ${hi};` });
+  }
+
+  // IS NULL / IS NOT NULL（演示语法，即使当前数据无空也可执行）
+  list.push({ name: 'IS NULL', sql: `SELECT * FROM ${table} WHERE ${c2} IS NULL;` });
+  list.push({ name: 'IS NOT NULL', sql: `SELECT * FROM ${table} WHERE ${c2} IS NOT NULL;` });
+
+  // LIMIT 扩展
+  list.push({ name: 'LIMIT OFFSET', sql: `SELECT * FROM ${table} ORDER BY ${cName} LIMIT 3 OFFSET 2;`, hint: '跳过2条，取3条' });
+  list.push({ name: 'LIMIT m,n', sql: `SELECT * FROM ${table} ORDER BY ${cName} LIMIT 2, 3;`, hint: '从第3条开始取3条（MySQL风格）' });
 
   // INSERT：构造一条基本插入
   if (cols.length) {
@@ -142,9 +178,8 @@ function makeExamples(db: Database, table: string, override?: Schema) {
 
     // UPDATE：更新一行（按第一列当主键的思路示例）
     const pk = cols[0]?.name || 'id';
-    // 选择一个可更新列（优先数值列）
     const upCol = cols.find(isNumericCol) || cols.find(c => c.name !== pk) || cols[0];
-    const sampleId = (db.rows as any)[table]?.[0]?.[pk] ?? 1;
+    const sampleId = (rows[0]?.[pk] ?? 1);
     let setExpr = '';
     if (upCol) {
       if (isNumericCol(upCol)) {
@@ -161,6 +196,25 @@ function makeExamples(db: Database, table: string, override?: Schema) {
 
 function isNumericCol(c: Column) {
   return c.type === 'INT' || c.type === 'INTEGER' || c.type === 'REAL' || c.type === 'DECIMAL';
+}
+
+function isTextCol(c: Column) {
+  return c.type === 'TEXT' || c.type === 'CHAR' || c.type === 'VARCHAR';
+}
+
+function sampleValues(rows: any[], col: string, k: number): any[] {
+  if (!rows || !rows.length) return [];
+  const uniq = new Set<any>();
+  const out: any[] = [];
+  for (const r of rows) {
+    const v = r?.[col];
+    if (!uniq.has(v)) {
+      uniq.add(v);
+      out.push(v);
+      if (out.length >= k) break;
+    }
+  }
+  return out;
 }
 
 function mockLiteral(c?: Column, i?: number): string {

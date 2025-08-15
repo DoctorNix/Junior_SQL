@@ -20,7 +20,8 @@ export default function DataTable({ db, tableName, compact, maxRows }: Props) {
     );
   }
 
-  const bodyRows = typeof maxRows === 'number' ? rows.slice(0, maxRows) : rows;
+  const effectiveMaxRows = typeof maxRows === 'number' ? maxRows : rows.length;
+  const bodyRows = rows.slice(0, effectiveMaxRows);
   const isEmpty = bodyRows.length === 0;
 
   return (
@@ -54,7 +55,7 @@ export default function DataTable({ db, tableName, compact, maxRows }: Props) {
           )}
         </tbody>
       </table>
-      {typeof maxRows === 'number' && rows.length > bodyRows.length ? (
+      {rows.length > bodyRows.length ? (
         <div style={{ marginTop: 8, fontSize: 12, color: '#64748b' }}>
           已显示 {bodyRows.length} / {rows.length} 行
         </div>

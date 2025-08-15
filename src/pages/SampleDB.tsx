@@ -56,37 +56,53 @@ export default function SampleDB() {
 
   return (
     <div>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-        <QueryPanel
-          db={db}
-          setDB={setDB}
-          onResult={setResult}
-          title="SampleDB：查询编辑区"
-          defaultSQL={
-            `-- 示例：按部门编号统计人数与平均年龄（无 JOIN 版）
-            SELECT dept_id AS dept, COUNT(*) AS cnt, AVG(age) AS avg_age
-            FROM people
-            GROUP BY dept_id
-            ORDER BY cnt DESC;`
-          }
-        />
-
-        <ResultTable result={result} title="SampleDB：结果" />
+      <div style={{ width: '100%', boxSizing: 'border-box', padding: '0 12px' }}>
+        <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)',
+        alignItems: 'stretch',
+        gap: 12,
+        width: '100%',
+        boxSizing: 'border-box'
+      }}>
+        <div className="panel" style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+          <QueryPanel
+            db={db}
+            setDB={setDB}
+            onResult={setResult}
+            title="SampleDB：查询编辑区"
+            defaultSQL={
+              `-- 示例：按部门编号统计人数与平均年龄（无 JOIN 版）
+              SELECT dept_id AS dept, COUNT(*) AS cnt, AVG(age) AS avg_age
+              FROM people
+              GROUP BY dept_id
+              ORDER BY cnt DESC;`
+            }
+          />
+        </div>
+        <div className="panel" style={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 560 }}>
+          <ResultTable result={result} title="SampleDB：结果" />
+        </div>
       </div>
 
       <div style={{ marginTop: 12 }}>
         <h3 style={{ margin: '8px 0' }}>浏览 people / dept</h3>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)', gap: 12 }}>
           <div className="panel" style={{ margin: 0 }}>
             <h4 style={{ marginTop: 0 }}>people</h4>
-            <DataTable db={db} tableName="people" compact maxRows={db.rows.people.length} />
+            <div style={{ width: '100%' }}>
+              <DataTable db={db} tableName="people" compact maxRows={db.rows.people.length} />
+            </div>
           </div>
           <div className="panel" style={{ margin: 0 }}>
             <h4 style={{ marginTop: 0 }}>dept</h4>
-            <DataTable db={db} tableName="dept" compact maxRows={db.rows.dept.length} />
+            <div style={{ width: '100%' }}>
+              <DataTable db={db} tableName="dept" compact maxRows={db.rows.dept.length} />
+            </div>
           </div>
         </div>
       </div>
+    </div>
     </div>
   );
 }

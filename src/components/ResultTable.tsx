@@ -1,5 +1,3 @@
-
-
 import React from 'react';
 import type { QueryResult } from '../engine/types';
 
@@ -7,14 +5,24 @@ export type ResultTableProps = {
   result: QueryResult | null;
   title?: string;
   compact?: boolean;
-  maxHeight?: number; // px, for scroll area
-  maxRows?: number;   // soft cap for visible rows
+  /**
+   * Preferred maximum height for the scroll area (in px). If provided, vertical
+   * scrolling is enabled when content exceeds this height.
+   */
+  maxHeight?: number;
+  /**
+   * Preferred minimum height for the table area (in px). Useful for making
+   * both columns look equally tall without forcing scrolling.
+   */
+  minHeight?: number;
+  /** Soft cap for visible rows (slice in-memory rows before render). */
+  maxRows?: number;
 };
 
-export default function ResultTable({ result, title = '查询结果', compact, maxHeight = 320, maxRows }: ResultTableProps) {
+export default function ResultTable({ result, title = '查询结果', compact, maxHeight, minHeight, maxRows }: ResultTableProps) {
   if (!result) {
     return (
-      <div className="panel" style={{ marginTop: 0 }}>
+      <div className="panel" style={{ marginTop: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
         <div style={{ fontSize: 12, color: '#64748b' }}>还没有结果，先运行一个查询吧～</div>
       </div>
     );
@@ -29,7 +37,7 @@ export default function ResultTable({ result, title = '查询结果', compact, m
   const singleMsgKey = columns.length === 1 && (columns[0] === 'message' || columns[0] === 'error') ? columns[0] : null;
 
   return (
-    <div className="panel" style={{ marginTop: 0 }}>
+    <div className="panel" style={{ marginTop: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12 }}>
         <h2 style={{ margin: 0 }}>{title}</h2>
         <div style={{ fontSize: 12, color: '#64748b' }}>显示 {displayRows.length} / {rows?.length ?? 0} 行 · {columns?.length ?? 0} 列</div>
@@ -40,7 +48,16 @@ export default function ResultTable({ result, title = '查询结果', compact, m
           {rows?.[0]?.[singleMsgKey] ?? ''}
         </div>
       ) : (
-        <div style={{ overflowX: 'auto', maxHeight, overflowY: 'auto', marginTop: 8 }}>
+        <div
+          style={{
+            marginTop: 8,
+            overflowX: 'auto',
+            overflowY: typeof maxHeight === 'number' ? 'auto' : 'visible',
+            ...(typeof minHeight === 'number' ? { minHeight } : {}),
+            ...(typeof maxHeight === 'number' ? { maxHeight } : {}),
+            flex: 1,
+          }}
+        >
           <table className="result-table" style={compact ? { fontSize: 12 } : undefined}>
             <thead>
               <tr>
@@ -86,4 +103,3 @@ function formatCell(v: any) {
   if (s.length > 150) s = s.slice(0, 147) + '...';
   return s;
 }
-

@@ -28,29 +28,78 @@ export function runSQL(sql: string, db: Database, setDB: (next: Database) => voi
     return msgResult(`Created ${schemas.length} table(s). Active: ${last}`);
   }
 
+  // CREATE VIEW view_name AS <select>
+  const viewMatch = cleaned.match(/^CREATE\s+VIEW\s+(\w+)\s+AS\s+([\s\S]+)$/i);
+  if (viewMatch) {
+    const viewName = viewMatch[1];
+    const selectSql = stripComments(viewMatch[2]).replace(/;\s*$/, '').trim();
+    if (!/^SELECT\s+/i.test(selectSql)) throw new Error('CREATE VIEW expects: CREATE VIEW name AS SELECT ...');
+
+    // evaluate the select to materialize the view now (simple, kid-friendly)
+    const res = selectQuery(selectSql, db);
+
+    // infer a lightweight schema from result columns
+    const columns: Column[] = res.columns.map((colName) => {
+      const values = res.rows.map(r => (r as any)[colName]).filter(v => v !== null && v !== undefined);
+      const inferred: ColType = inferTypeFromValues(values);
+      return { id: colName + '_' + Math.random().toString(36).slice(2,6), name: colName, type: inferred, primary: false } as Column;
+    });
+
+    const next: Database = {
+      ...db,
+      active: viewName,
+      schemas: { ...db.schemas, [viewName]: { tableName: viewName, columns } },
+      rows: { ...db.rows, [viewName]: res.rows.map(r => {
+        const obj: Row = {};
+        for (const c of res.columns) obj[c] = (r as any)[c];
+        return obj;
+      }) }
+    };
+    setDB(next);
+    return msgResult(`Created view ${viewName} (materialized) with ${res.rows.length} row(s).`);
+  }
+
   if (/^INSERT\s+/i.test(cleaned)) {
-    const m = cleaned
-      .replace(/;\s*$/,'')
-      .match(/^INSERT\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)$/i);
-    if (!m) throw new Error('Only supports: INSERT INTO table (col, ...) VALUES (val, ...)');
+    const stmt = cleaned.replace(/;\s*$/, '');
+    // Support: INSERT INTO tbl [(col,...)] VALUES (v1,...), (v1,...), ...
+    const m = stmt.match(/^INSERT\s+INTO\s+(\w+)\s*(?:\(([^)]+)\))?\s+VALUES\s*(\(.+\))$/i);
+    if (!m) throw new Error('Only supports: INSERT INTO table [(col, ...)] VALUES (val, ...)[, (val, ...), ...]');
     const tbl = m[1];
     if (!db.schemas[tbl]) throw new Error('Unknown table: ' + tbl);
-    const cols = m[2].split(',').map(s => s.trim());
-    const rawVals = splitCSV(m[3]);
-    if (cols.length !== rawVals.length) throw new Error('Columns/values length mismatch');
-    const row: Row = {};
-    cols.forEach((c, i) => (row[c] = parseLiteral(rawVals[i])));
-    const withTypes = castRowTypes(row, db.schemas[tbl]);
-    const next: Database = { ...db, rows: { ...db.rows, [tbl]: [...(db.rows[tbl] || []), withTypes] } };
+
+    const schema = db.schemas[tbl];
+    const colList = (m[2] ? m[2].split(',').map(s => s.trim()) : schema.columns.map(c => c.name));
+    const valuesPart = m[3].trim();
+
+    const groups = splitTuples(valuesPart); // ["(a,b)", "(c,d)"]
+    if (!groups.length) throw new Error('No VALUES provided');
+
+    const inserted: Row[] = [];
+    for (const g of groups) {
+      const inner = g.replace(/^\(/, '').replace(/\)$/, '');
+      const rawVals = splitCSV(inner);
+      if (colList.length !== rawVals.length) throw new Error('Columns/values length mismatch');
+      const row: Row = {};
+      colList.forEach((c, i) => (row[c] = parseLiteral(rawVals[i])));
+      inserted.push(castRowTypes(row, schema));
+    }
+
+    const next: Database = { ...db, rows: { ...db.rows, [tbl]: [...(db.rows[tbl] || []), ...inserted] } };
     setDB(next);
-    return { columns: Object.keys(withTypes), rows: [withTypes] };
+
+    // Return a concise message for batch, or the single row echo when only one
+    if (inserted.length === 1) {
+      const one = inserted[0];
+      return { columns: Object.keys(one), rows: [one] };
+    }
+    return { columns: ['message', 'affected'], rows: [{ message: `Inserted ${inserted.length} row(s) into ${tbl}.`, affected: inserted.length }] };
   }
 
   if (/^UPDATE\s+/i.test(cleaned)) {
     return updateQuery(cleaned, db, setDB);
   }
     
-  if (!/^SELECT\s+/i.test(cleaned)) throw new Error('Supported statements: CREATE / INSERT / SELECT / UPDATE');
+  if (!/^SELECT\s+/i.test(cleaned)) throw new Error('Supported statements: CREATE / INSERT / SELECT / UPDATE / CREATE VIEW');
 
   return selectQuery(cleaned, db);
 }
@@ -59,7 +108,12 @@ export function selectQuery(sql: string, db: Database): QueryResult {
   const s = stripComments(sql).replace(/\s+/g, ' ').replace(/;\s*$/, '').trim();
   const m = s.match(/^SELECT\s+([\s\S]+?)\s+FROM\s+(\w+)(?:\s+(?!WHERE\b|GROUP\b|ORDER\b|LIMIT\b|JOIN\b)(\w+))?([\s\S]*)$/i);
   if (!m) throw new Error('Malformed SELECT');
-  const selectPart = m[1].trim();
+  let selectPart = m[1].trim();
+  let isDistinct = false;
+  if (/^DISTINCT\b/i.test(selectPart)) {
+    isDistinct = true;
+    selectPart = selectPart.replace(/^DISTINCT\s+/i, '').trim();
+  }
   const baseTable = m[2];
   const baseAlias = (m[3] || '').trim() || baseTable;
   let tail = m[4] || '';
@@ -151,6 +205,17 @@ export function selectQuery(sql: string, db: Database): QueryResult {
     }
   }
 
+  // DISTINCT
+  if (isDistinct) {
+    const seen = new Set<string>();
+    projected = projected.filter(r => {
+      const key = JSON.stringify(r);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
   // ORDER BY
   const orderMatch = tail.match(/\s+ORDER\s+BY\s+([\s\S]*?)(?=\s+LIMIT|$)/i);
   if (orderMatch) {
@@ -169,9 +234,23 @@ export function selectQuery(sql: string, db: Database): QueryResult {
     });
   }
 
-  // LIMIT
-  const limitMatch = tail.match(/\s+LIMIT\s+(\d+)/i);
-  if (limitMatch) projected = projected.slice(0, parseInt(limitMatch[1], 10));
+  // LIMIT (support: LIMIT n  |  LIMIT n OFFSET m  |  LIMIT m, n)
+  let lm = tail.match(/\s+LIMIT\s+(\d+)\s+OFFSET\s+(\d+)/i);
+  if (lm) {
+    const n = parseInt(lm[1], 10);
+    const off = parseInt(lm[2], 10);
+    projected = projected.slice(off, off + n);
+  } else {
+    lm = tail.match(/\s+LIMIT\s+(\d+)\s*,\s*(\d+)/i);
+    if (lm) {
+      const off = parseInt(lm[1], 10);
+      const n = parseInt(lm[2], 10);
+      projected = projected.slice(off, off + n);
+    } else {
+      lm = tail.match(/\s+LIMIT\s+(\d+)/i);
+      if (lm) projected = projected.slice(0, parseInt(lm[1], 10));
+    }
+  }
 
   const columns = projected.length ? Object.keys(projected[0]) : selectors.filter(s=>s.kind!=='star').map(s=>s.alias);
   return { columns, rows: projected };
@@ -306,7 +385,7 @@ type AST =
 
 function tokenize(input: string): Token[] {
   const out: Token[] = [];
-  const re = /\s+|\(|\)|>=|<=|!=|=|>|<|\bAND\b|\bOR\b|\bLIKE\b|\btrue\b|\bfalse\b|\bNULL\b|\*|[A-Za-z_][\w.]*|'[^']*'|"[^"]*"|\d*\.\d+|\d+/gi;
+  const re = /\s+|\(|\)|>=|<=|!=|=|>|<|\bAND\b|\bOR\b|\bNOT\b|\bIN\b|\bBETWEEN\b|\bIS\b|\bLIKE\b|\btrue\b|\bfalse\b|\bNULL\b|\*|[A-Za-z_][\w.]*|'[^']*'|"[^"]*"|\d*\.\d+|\d+/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(input))) {
     const t = m[0];
@@ -320,6 +399,10 @@ function tokenize(input: string): Token[] {
     else if (/^LIKE$/i.test(t)) type = 'LIKE';
     else if (/^true$/i.test(t) || /^false$/i.test(t)) type = 'BOOL';
     else if (/^NULL$/i.test(t)) type = 'NULL';
+    else if (/^NOT$/i.test(t)) type = 'NOT';
+    else if (/^IN$/i.test(t)) type = 'IN';
+    else if (/^BETWEEN$/i.test(t)) type = 'BETWEEN';
+    else if (/^IS$/i.test(t)) type = 'IS';
     else if (/^'[^']*'$/.test(t) || /^"[^"]*"$/.test(t)) type = 'STR';
     else if (/^\d*\.\d+$/.test(t) || /^\d+$/.test(t)) type = 'NUM';
     out.push({ type, value: t });
@@ -344,11 +427,54 @@ function parseBoolExpr(tokens: Token[]): AST {
     const leftTok = tokens[i++];
     const opTok = tokens[i++];
     if (!leftTok || !opTok) throw new Error('Bad comparison');
+
+    // LIKE
     if (opTok.type === 'LIKE') {
       const patTok = tokens[i++];
       if (!patTok) throw new Error('LIKE needs pattern');
       return { kind: 'like', left: leftTok.value, pattern: stripQuotes(patTok.value) };
     }
+
+    // IS [NOT] NULL
+    if (opTok.type === 'IS') {
+      let negate = false;
+      if (tokens[i] && tokens[i].type === 'NOT') { negate = true; i++; }
+      const what = tokens[i++];
+      if (!what || what.type !== 'NULL') throw new Error('IS only supports NULL');
+      return { kind: 'cmp', left: leftTok.value, op: negate ? 'IS_NOT_NULL' : 'IS_NULL', right: null } as any;
+    }
+
+    // [NOT] IN (...)
+    if (opTok.type === 'IN' || opTok.type === 'NOT') {
+      let negate = false;
+      if (opTok.type === 'NOT') {
+        const nxt = tokens[i++];
+        if (!nxt || nxt.type !== 'IN') throw new Error('Expected IN after NOT');
+        negate = true;
+      }
+      const lp = tokens[i++]; if (!lp || lp.type !== 'LP') throw new Error('IN expects (');
+      const items: any[] = [];
+      while (i < tokens.length && tokens[i].type !== 'RP') {
+        const t = tokens[i++];
+        if (!t) break;
+        const lit = (t.type === 'SYM') ? t.value : literalFromToken(t);
+        items.push(lit);
+      }
+      if (tokens[i] && tokens[i].type === 'RP') i++;
+      return { kind: 'cmp', left: leftTok.value, op: negate ? 'NOT_IN' : 'IN', right: items } as any;
+    }
+
+    // BETWEEN a AND b
+    if (opTok.type === 'BETWEEN') {
+      const aTok = tokens[i++];
+      const andTok = tokens[i++];
+      const bTok = tokens[i++];
+      if (!aTok || !andTok || !bTok || andTok.type !== 'AND') throw new Error('BETWEEN requires: expr BETWEEN a AND b');
+      const a = (aTok.type === 'SYM') ? aTok.value : literalFromToken(aTok);
+      const b = (bTok.type === 'SYM') ? bTok.value : literalFromToken(bTok);
+      return { kind: 'cmp', left: leftTok.value, op: 'BETWEEN', right: { a, b } } as any;
+    }
+
     if (opTok.type !== 'OP') throw new Error('Expected operator');
     const rightTok = tokens[i++]; if (!rightTok) throw new Error('Missing right side');
     return { kind: 'cmp', left: leftTok.value, op: opTok.value, right: literalFromToken(rightTok) };
@@ -367,7 +493,8 @@ function evalAst(ast: AST, row: any): boolean {
       const lhs = getValue(ast.left, row) ?? '';
       const pattern = ast.pattern
         .replace(/([.*+?^${}()|[\]\\])/g, '\\$1')
-        .replace(/%/g, '.*');
+        .replace(/%/g, '.*')
+        .replace(/_/g, '.');
       return new RegExp(`^${pattern}$`, 'i').test(String(lhs));
     }
     case 'cmp': {
@@ -380,6 +507,24 @@ function evalAst(ast: AST, row: any): boolean {
         case '<': return (lhs as any) < (rhs as any);
         case '>=': return (lhs as any) >= (rhs as any);
         case '<=': return (lhs as any) <= (rhs as any);
+        case 'IS_NULL': return lhs === null || lhs === undefined;
+        case 'IS_NOT_NULL': return !(lhs === null || lhs === undefined);
+        case 'IN': {
+          const arr = Array.isArray(rhs) ? rhs : [];
+          return arr.some((v: any) => valueEquals(lhs, v, row));
+        }
+        case 'NOT_IN': {
+          const arr = Array.isArray(rhs) ? rhs : [];
+          return !arr.some((v: any) => valueEquals(lhs, v, row));
+        }
+        case 'BETWEEN': {
+          const a = (rhs as any).a;
+          const b = (rhs as any).b;
+          const lv = typeof lhs === 'number' ? lhs : Number(lhs);
+          const av = typeof a === 'number' ? a : Number(valueOrGet(a, row));
+          const bv = typeof b === 'number' ? b : Number(valueOrGet(b, row));
+          return lv >= av && lv <= bv;
+        }
         default: return false;
       }
     }
@@ -507,6 +652,31 @@ function splitCSV(s: string): string[] {
   return out;
 }
 
+// Splits top-level parenthesized tuples, respecting quotes
+function splitTuples(s: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let depth = 0;
+  let q: string | null = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q) {
+      cur += ch;
+      if (ch === q) q = null;
+      continue;
+    }
+    if (ch === '\'' || ch === '"') {
+      q = ch; cur += ch; continue;
+    }
+    if (ch === '(') { depth++; cur += ch; continue; }
+    if (ch === ')') { depth--; cur += ch; if (depth === 0) { out.push(cur.trim()); cur = ''; } continue; }
+    if (ch === ',' && depth === 0) { /* separator between tuples */ continue; }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out.filter(Boolean);
+}
+
 function castRowTypes(row: Row, schema: Schema) {
   const typed: Row = {};
   for (const c of schema.columns) {
@@ -592,3 +762,25 @@ function msgResult(message: string): QueryResult {
   return emptyResult(message);
 }
 
+
+function valueOrGet(v: any, row: any) {
+  return typeof v === 'string' && /[A-Za-z_]/.test(v) && !/^'.*'$/.test(v) && !/^\".*\"$/.test(v) ? getValue(v, row) : v;
+}
+
+function valueEquals(a: any, b: any, row: any) {
+  const av = valueOrGet(a, row);
+  const bv = valueOrGet(b, row);
+  return av === bv;
+}
+
+function inferTypeFromValues(values: any[]): ColType {
+  // prefer BOOLEAN if all booleans
+  if (values.length && values.every(v => typeof v === 'boolean')) return 'BOOLEAN';
+  // if all numbers and all integers -> INT
+  if (values.length && values.every(v => typeof v === 'number')) {
+    if (values.every(v => Number.isInteger(v))) return 'INT';
+    return 'REAL';
+  }
+  // default to TEXT (covers strings/mixed)
+  return 'TEXT';
+}

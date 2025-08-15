@@ -21,7 +21,9 @@ export default function App() {
 
       {page === 'play' ? <PlayLab /> : <SampleDB />}
       <footer style={{ textAlign: 'center', marginTop: '1rem', fontSize: '0.85rem' }}>
-        Version {APP_VERSION} Where SQL is fun and easy! <br />
+        Version {APP_VERSION} <br />
+        I hope this can help you code SQL with fun! <br />
+        Developed by Jacob Pan, 2025. <br />
       </footer>
     </div>
     
