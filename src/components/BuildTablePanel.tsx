@@ -1,7 +1,129 @@
 import React from 'react';
-import type { Schema, Column, ColType, Database } from '../engine/types.ts';
+import type { Schema, Column, ColType, Database, UniqueSpec, ForeignKeyAction } from '../engine/types';
 import { uid } from '../utils/helpers.ts';
 import { runSQL } from '../engine/sqlEngine.ts';
+
+function UniqueEditor({ schema, onSchemaChange }: { schema: Schema; onSchemaChange: (s: Schema) => void }) {
+  // normalize to array of comma-joined strings for editing
+  const uniqueSpecs = (schema.uniqueKeys || []) as any[];
+  const uniqueLines = uniqueSpecs.map((u) => Array.isArray(u) ? u.join(', ') : (u?.columns || []).join(', '));
+  const [lines, setLines] = React.useState<string[]>(uniqueLines);
+
+  // stable dep signature for changes
+  const depSig = (schema.uniqueKeys || [])
+    .map((u: any) => Array.isArray(u) ? u.join('|') : (u?.columns || []).join('|'))
+    .join(';');
+  React.useEffect(() => {
+    const fresh = (schema.uniqueKeys || []) as any[];
+    setLines(fresh.map((u) => Array.isArray(u) ? u.join(', ') : (u?.columns || []).join(', ')));
+  }, [depSig]);
+
+  const add = () => setLines((prev) => [...prev, '']);
+  const remove = (i: number) => setLines((prev) => prev.filter((_, idx) => idx !== i));
+  const update = (i: number, v: string) => setLines((prev) => prev.map((x, idx) => (idx === i ? v : x)));
+  const apply = () => {
+    const parsed: UniqueSpec[] = lines
+      .map((s) => s.split(',').map((x) => x.trim()).filter(Boolean))
+      .filter((arr) => arr.length > 0)
+      .map((columns) => ({ columns }));
+    onSchemaChange({ ...schema, uniqueKeys: parsed.length ? parsed : undefined });
+  };
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ fontSize: 12, color: '#64748b', marginBottom: 6 }}>UNIQUE 约束（每行一组列，逗号分隔）</div>
+      <div style={{ display: 'grid', gap: 6 }}>
+        {lines.map((s, i) => (
+          <div key={i} style={{ display: 'flex', gap: 6 }}>
+            <input className="input" placeholder="col1, col2" value={s} onChange={(e) => update(i, e.target.value)} />
+            <button className="button--small" onClick={() => remove(i)}>删除</button>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+        <button onClick={add}>+ 新增 UNIQUE 组</button>
+        <button className="nav-button" onClick={apply}>应用 UNIQUE</button>
+      </div>
+    </div>
+  );
+}
+
+function FkEditor({ schema, onSchemaChange }: { schema: Schema; onSchemaChange: (s: Schema) => void }) {
+  const fks = schema.foreignKeys || [];
+  const [rows, setRows] = React.useState(
+    fks.map((f) => ({
+      cols: (f.columns || []).join(', '),
+      refTable: f.refTable,
+      refCols: (f.refColumns || []).join(', '),
+      onDelete: (f.onDelete as ForeignKeyAction) || 'RESTRICT',
+      onUpdate: (f.onUpdate as ForeignKeyAction) || 'RESTRICT',
+    }))
+  );
+
+  const fkSig = (schema.foreignKeys || [])
+    .map((f) => `${(f.columns || []).join('|')}->${f.refTable}(${(f.refColumns || []).join('|')})/${f.onDelete}/${f.onUpdate}`)
+    .join(';');
+  React.useEffect(() => {
+    setRows(
+      (schema.foreignKeys || []).map((f) => ({
+        cols: (f.columns || []).join(', '),
+        refTable: f.refTable,
+        refCols: (f.refColumns || []).join(', '),
+        onDelete: (f.onDelete as ForeignKeyAction) || 'RESTRICT',
+        onUpdate: (f.onUpdate as ForeignKeyAction) || 'RESTRICT',
+      }))
+    );
+  }, [fkSig]);
+
+  const add = () => setRows((prev) => [...prev, { cols: '', refTable: '', refCols: '', onDelete: 'RESTRICT', onUpdate: 'RESTRICT' }]);
+  const remove = (i: number) => setRows((prev) => prev.filter((_, idx) => idx !== i));
+  const setField = (i: number, k: 'cols' | 'refTable' | 'refCols' | 'onDelete' | 'onUpdate', v: string) =>
+    setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, [k]: v } : r)));
+  const apply = () => {
+    const parsed = rows
+      .map((r) => ({
+        columns: r.cols.split(',').map((s) => s.trim()).filter(Boolean),
+        refTable: r.refTable.trim(),
+        refColumns: r.refCols.split(',').map((s) => s.trim()).filter(Boolean),
+        onDelete: (r.onDelete as ForeignKeyAction) || 'RESTRICT',
+        onUpdate: (r.onUpdate as ForeignKeyAction) || 'RESTRICT',
+      }))
+      .filter((f) => f.refTable && f.columns.length && f.refColumns.length);
+    onSchemaChange({ ...schema, foreignKeys: parsed.length ? parsed : undefined });
+  };
+
+  const actions: ForeignKeyAction[] = ['NO ACTION', 'RESTRICT', 'CASCADE', 'SET NULL', 'SET DEFAULT'];
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div style={{ fontSize: 12, color: '#64748b', marginBottom: 6 }}>FOREIGN KEY（最简形式）</div>
+      <div style={{ display: 'grid', gap: 8 }}>
+        {rows.map((r, i) => (
+          <div key={i} style={{ display: 'grid', gap: 6, gridTemplateColumns: '2fr 1fr 2fr 1fr 1fr auto' }}>
+            <input className="input" placeholder="本表列：col1, col2" value={r.cols} onChange={(e) => setField(i, 'cols', e.target.value)} />
+            <input className="input" placeholder="引用表" value={r.refTable} onChange={(e) => setField(i, 'refTable', e.target.value)} />
+            <input className="input" placeholder="引用列：id 或 id1, id2" value={r.refCols} onChange={(e) => setField(i, 'refCols', e.target.value)} />
+            <select className="input" value={r.onDelete} onChange={(e) => setField(i, 'onDelete', e.target.value)}>
+              {actions.map((x) => (
+                <option key={x} value={x}>{x}</option>
+              ))}
+            </select>
+            <select className="input" value={r.onUpdate} onChange={(e) => setField(i, 'onUpdate', e.target.value)}>
+              {actions.map((x) => (
+                <option key={x} value={x}>{x}</option>
+              ))}
+            </select>
+            <button className="button--small" onClick={() => remove(i)}>删除</button>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+        <button onClick={add}>+ 新增外键</button>
+        <button className="nav-button" onClick={apply}>应用外键</button>
+      </div>
+    </div>
+  );
+}
 
 // ------------------------------------
 // Props
@@ -14,12 +136,24 @@ export type BuildTablePanelProps = {
   disabled?: boolean;
   db?: Database;
   setDB?: (next: Database) => void;
+  /** 可选：把生成的 SQL 交给上层（例如 QueryPanel） */
+  onRunSQL?: (sql: string) => void;
 };
+
+function togglePrimary(schema: Schema, colName: string, onSchemaChange: (next: Schema) => void) {
+  const current = new Set(schema.primaryKey || []);
+  if (current.has(colName)) current.delete(colName); else current.add(colName);
+  const nextPK = Array.from(current);
+  const next: Schema = { ...schema, primaryKey: nextPK.length ? nextPK : undefined };
+  // 清除列级 primary 标记（以表级为准）
+  next.columns = next.columns.map(c => c.name === colName ? { ...c, primary: false } : c);
+  onSchemaChange(next);
+}
 
 // ------------------------------------
 // Component
 // ------------------------------------
-export default function BuildTablePanel({ schema, onSchemaChange, onApply, applyLabel = '应用到数据库', disabled, db, setDB }: BuildTablePanelProps) {
+export default function BuildTablePanel({ schema, onSchemaChange, onApply, applyLabel = '应用到数据库', disabled, db, setDB, onRunSQL }: BuildTablePanelProps) {
   const setTableName = (name: string) => {
     onSchemaChange({ ...schema, tableName: normalizeName(name) });
   };
@@ -42,11 +176,6 @@ export default function BuildTablePanel({ schema, onSchemaChange, onApply, apply
     onSchemaChange({ ...schema, columns: cols });
   };
 
-  const setPrimary = (id: string, pk: boolean) => {
-    const cols = schema.columns.map(c => ({ ...c, primary: c.id === id ? pk : false }));
-    onSchemaChange({ ...schema, columns: cols });
-  };
-
   const createSQL = generateCreateSQL(schema);
 
   // ------------------------------
@@ -54,10 +183,12 @@ export default function BuildTablePanel({ schema, onSchemaChange, onApply, apply
   // ------------------------------
   const [batchRows, setBatchRows] = React.useState<Record<string, string>[]>([{}]);
 
+  const depsVar = `${schema.tableName}|${schema.columns.map(c=>c.id).join(',')}`;
+
   // when schema changes, keep objects but ensure shape; don't drop user values
   React.useEffect(() => {
     setBatchRows(rows => rows.map(r => ({ ...r })));
-  }, [schema.tableName, schema.columns.map(c => c.id).join(',')]);
+  }, [depsVar]);
 
   function setCell(rowIdx: number, colName: string, v: string) {
     setBatchRows(prev => prev.map((r, i) => (i === rowIdx ? { ...r, [colName]: v } : r)));
@@ -66,10 +197,22 @@ export default function BuildTablePanel({ schema, onSchemaChange, onApply, apply
   function removeRow(i: number) { setBatchRows(prev => prev.filter((_, idx) => idx !== i)); }
   function clearAll() { setBatchRows([{}]); }
 
+  // 对外兼容：setField 别名（用于父组件或其他模块调用）
+  function setField(rowIdx: number, colName: string, v: string) {
+    setCell(rowIdx, colName, v);
+  }
+
+  // 仅生成 INSERT SQL，并通过 onRunSQL 发送给外部（例如放入 QueryPanel 文本框）
+  function execInsert() {
+    const sql = buildCombinedInsertSQL();
+    if (!sql) return;
+    if (onRunSQL) onRunSQL(sql);
+  }
+
   function literalForSQL(col: Column, raw: string): string {
     const t = col.type;
     if (raw == null || raw.trim() === '') return 'NULL';
-    if (t === 'INT' || t === 'INTEGER' || t === 'REAL' || t === 'DECIMAL') return String(raw).trim();
+    if (t === 'INT' || t === 'INTEGER' || t === 'REAL' || t === 'DECIMAL' || t === 'FLOAT' || t === 'DOUBLE') return String(raw).trim();
     if (t === 'BOOLEAN') {
       const v = raw.trim().toLowerCase();
       if (v === 'true' || v === '1' || v === 'yes') return 'true';
@@ -123,13 +266,54 @@ export default function BuildTablePanel({ schema, onSchemaChange, onApply, apply
   return (
     <section className="panel" aria-label="Build Table">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-        <h2 style={{ margin: 0 }}>模块一：创造 Table</h2>
+        <h2 style={{ margin: 0 }}>创建 Table (Create Table)</h2>
         {onApply && (
           <button className="nav-button" onClick={onApply} disabled={disabled}>
             {applyLabel}
           </button>
         )}
       </div>
+
+      {/* DB context quick controls (optional) */}
+      {db && setDB && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
+          <label style={{ fontSize: 12, color: '#64748b' }}>当前目标表：</label>
+          <select
+            className="input"
+            value={db.active || ''}
+            onChange={(e) => {
+              const name = e.target.value;
+              setDB({ ...db, active: name });
+            }}
+          >
+            {Object.keys(db.schemas || {}).map((n) => (
+              <option key={n} value={n}>{n}</option>
+            ))}
+          </select>
+          <button
+            className="button--small"
+            onClick={() => {
+              const name = db.active;
+              if (!name) return;
+              const sc = db.schemas[name];
+              if (sc) onSchemaChange({ ...sc });
+            }}
+            disabled={!db.active}
+          >
+            从数据库载入到编辑器
+          </button>
+          <button
+            className="button--small"
+            onClick={() => {
+              if (!schema?.tableName) return;
+              setDB({ ...db, active: schema.tableName });
+            }}
+            disabled={!schema?.tableName}
+          >
+            将当前编辑表设为活动表
+          </button>
+        </div>
+      )}
 
       {/* Table name */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }}>
@@ -190,7 +374,7 @@ export default function BuildTablePanel({ schema, onSchemaChange, onApply, apply
                 }}
                 className="input"
               >
-                {['INT','INTEGER','REAL','DECIMAL','TEXT','CHAR','VARCHAR','BOOLEAN'].map(t => (
+                {['INT','INTEGER','REAL','FLOAT','DOUBLE','DECIMAL','TEXT','CHAR','VARCHAR','BOOLEAN'].map(t => (
                   <option key={t} value={t}>{t}</option>
                 ))}
               </select>
@@ -239,12 +423,12 @@ export default function BuildTablePanel({ schema, onSchemaChange, onApply, apply
                 </div>
               )}
 
-              {/* PK */}
+              {/* PK (table-level, composite allowed) */}
               <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
                 <input
                   type="checkbox"
-                  checked={!!c.primary}
-                  onChange={(e) => setPrimary(c.id, e.target.checked)}
+                  checked={!!(schema.primaryKey || []).includes(c.name)}
+                  onChange={() => togglePrimary(schema, c.name, onSchemaChange)}
                 />
                 PK
               </label>
@@ -256,6 +440,17 @@ export default function BuildTablePanel({ schema, onSchemaChange, onApply, apply
             </div>
           ))}
         </div>
+      </div>
+
+      {/* Table-level constraints */}
+      <div style={{ marginTop: 12, borderTop: '1px dashed #e2e8f0', paddingTop: 10 }}>
+        <h3 className="section-title" style={{ margin: 0 }}>表级约束（可选）</h3>
+
+        {/* UNIQUE groups (comma-separated columns) */}
+        <UniqueEditor schema={schema} onSchemaChange={onSchemaChange} />
+
+        {/* FOREIGN KEY (minimal) */}
+        <FkEditor schema={schema} onSchemaChange={onSchemaChange} />
       </div>
 
       {/* SQL preview */}
@@ -291,6 +486,7 @@ export default function BuildTablePanel({ schema, onSchemaChange, onApply, apply
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               <button onClick={addRow}>再加一行</button>
               <button onClick={clearAll}>清空</button>
+              <button onClick={execInsert} disabled={!buildCombinedInsertSQL()}>生成 SQL（发送到查询区）</button>
               <button className="nav-button" onClick={execBatchInsert}>插入全部（执行）</button>
             </div>
 
@@ -300,6 +496,54 @@ export default function BuildTablePanel({ schema, onSchemaChange, onApply, apply
           </div>
         )}
       </div>
+      {/* Schema Inspector (optional, read-only) */}
+      {db && (
+        <details style={{ marginTop: 12 }}>
+          <summary style={{ cursor: 'pointer', fontWeight: 600 }}>查看现有表（Schema Inspector）</summary>
+          <div style={{ marginTop: 8 }}>
+            {Object.keys(db.schemas).length === 0 && (
+              <div style={{ fontSize: 12, color: '#64748b' }}>数据库当前没有表。</div>
+            )}
+            {Object.keys(db.schemas).map((t) => {
+              const sc = db.schemas[t];
+              return (
+                <div key={t} style={{ marginBottom: 10, padding: 8, border: '1px solid #e5e7eb', borderRadius: 8 }}>
+                  <div style={{ fontWeight: 700 }}>{t}{db.active === t ? '  (active)' : ''}</div>
+                  <div style={{ fontSize: 12, color: '#64748b' }}>
+                    列：{sc.columns.map((c) => `${c.name}:${c.type}${c.length ? `(${c.length})` : ''}`).join(', ')}
+                  </div>
+                  {sc.primaryKey?.length ? (
+                    <div style={{ fontSize: 12 }}>PK: ({sc.primaryKey.join(', ')})</div>
+                  ) : null}
+                  {sc.uniqueKeys?.length ? (
+                    <div style={{ fontSize: 12 }}>
+                      UNIQUE:
+                      {(sc.uniqueKeys as any[]).map((u, i) => {
+                        const cols = Array.isArray(u) ? u : (u?.columns || []);
+                        return (
+                          <span key={i}> ({cols.join(', ')})</span>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                  {sc.foreignKeys?.length ? (
+                    <div style={{ fontSize: 12 }}>
+                      FK:
+                      {sc.foreignKeys.map((f, i) => (
+                        <div key={i} style={{ marginLeft: 12 }}>
+                          ({f.columns.join(', ')}) → {f.refTable}({f.refColumns.join(', ')})
+                          {f.onDelete ? ` ON DELETE ${f.onDelete}` : ''}
+                          {f.onUpdate ? ` ON UPDATE ${f.onUpdate}` : ''}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      )}
     </section>
   );
 }
@@ -329,6 +573,8 @@ function renderTypeWithParams(c: Column) {
     case 'CHAR': return `CHAR(${c.length ?? 1})`;
     case 'VARCHAR': return `VARCHAR(${c.length ?? 1})`;
     case 'DECIMAL': return `DECIMAL(${c.precision ?? 10}, ${c.scale ?? 0})`;
+    case 'FLOAT':
+    case 'DOUBLE':
     case 'INT':
     case 'INTEGER':
     case 'REAL':
@@ -340,10 +586,35 @@ function renderTypeWithParams(c: Column) {
 }
 
 function generateCreateSQL(schema: Schema) {
-  const cols = schema.columns.map(c => {
+  const colDefs = schema.columns.map(c => {
     const type = renderTypeWithParams(c);
-    const pk = c.primary ? ' PRIMARY KEY' : '';
-    return `${c.name} ${type}${pk}`;
-  }).join(', ');
-  return `CREATE TABLE ${schema.tableName} (${cols});`;
+    // 若使用表级 PK，则不再在列级标 PRIMARY KEY
+    const pkCol = (schema.primaryKey || []).includes(c.name) ? '' : (c.primary ? ' PRIMARY KEY' : '');
+    return `${c.name} ${type}${pkCol}`;
+  });
+
+  const tableClauses: string[] = [];
+  if (schema.primaryKey && schema.primaryKey.length) {
+    tableClauses.push(`PRIMARY KEY (${schema.primaryKey.join(', ')})`);
+  }
+  if (schema.uniqueKeys && schema.uniqueKeys.length) {
+    for (const uk of schema.uniqueKeys as any[]) {
+      const cols = Array.isArray(uk) ? uk : (uk?.columns || []);
+      if (cols.length) tableClauses.push(`UNIQUE (${cols.join(', ')})`);
+    }
+  }
+  if (schema.foreignKeys && schema.foreignKeys.length) {
+    for (const fk of schema.foreignKeys as any[]) {
+      const cols = (fk.columns || fk.cols || []) as string[];
+      const refCols = (fk.refColumns || fk.refCols || []) as string[];
+      const onDel = fk.onDelete ? ` ON DELETE ${String(fk.onDelete)}` : '';
+      const onUpd = fk.onUpdate ? ` ON UPDATE ${String(fk.onUpdate)}` : '';
+      if (cols.length && fk.refTable && refCols.length) {
+        tableClauses.push(`FOREIGN KEY (${cols.join(', ')}) REFERENCES ${fk.refTable} (${refCols.join(', ')})${onDel}${onUpd}`);
+      }
+    }
+  }
+
+  const all = [...colDefs, ...tableClauses].join(', ');
+  return `CREATE TABLE ${schema.tableName} (${all});`;
 }

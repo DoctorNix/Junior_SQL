@@ -2,26 +2,31 @@ import React, { useState } from 'react';
 import QueryPanel from '../components/QueryPanel.tsx';
 import ResultTable from '../components/ResultTable.tsx';
 import DataTable from '../components/DataTable.tsx';
-import type { Database, QueryResult, Schema } from '../engine/types.ts';
+import type { Database, QueryResult, Schema } from '../engine/types';
 
 const peopleSchema: Schema = {
   tableName: 'people',
   columns: [
-    { id: uid(), name: 'id', type: 'INT', primary: true },
+    { id: uid(), name: 'id', type: 'INT' },
     { id: uid(), name: 'name', type: 'VARCHAR', length: 20 },
     { id: uid(), name: 'age', type: 'INT' },
     { id: uid(), name: 'dept_id', type: 'INT' },
     { id: uid(), name: 'salary', type: 'DECIMAL', precision: 10, scale: 2 },
     { id: uid(), name: 'active', type: 'BOOLEAN' },
   ],
+  primaryKey: ['id'],
+  foreignKeys: [
+    { columns: ['dept_id'], refTable: 'dept', refColumns: ['id'], onDelete: 'RESTRICT', onUpdate: 'RESTRICT' }
+  ],
 };
 
 const deptSchema: Schema = {
   tableName: 'dept',
   columns: [
-    { id: uid(), name: 'id', type: 'INT', primary: true },
+    { id: uid(), name: 'id', type: 'INT' },
     { id: uid(), name: 'dept_name', type: 'VARCHAR', length: 24 },
   ],
+  primaryKey: ['id'],
 };
 
 const initialDB: Database = {
@@ -57,33 +62,37 @@ export default function SampleDB() {
   return (
     <div>
       <div style={{ width: '100%', boxSizing: 'border-box', padding: '0 12px' }}>
-        <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)',
-        alignItems: 'stretch',
-        gap: 12,
-        width: '100%',
-        boxSizing: 'border-box'
-      }}>
-        <div className="panel" style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-          <QueryPanel
-            db={db}
-            setDB={setDB}
-            onResult={setResult}
-            title="SampleDB：查询编辑区"
-            defaultSQL={
-              `-- 示例：按部门编号统计人数与平均年龄（无 JOIN 版）
-              SELECT dept_id AS dept, COUNT(*) AS cnt, AVG(age) AS avg_age
-              FROM people
-              GROUP BY dept_id
-              ORDER BY cnt DESC;`
-            }
-          />
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)',
+            alignItems: 'stretch',
+            gap: 12,
+            width: '100%',
+            boxSizing: 'border-box'
+          }}
+        >
+          <div className="panel" style={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 560 }}>
+            <QueryPanel
+              db={db}
+              setDB={setDB}
+              onResult={setResult}
+              title="SampleDB 编辑空间 (Query Panel)"
+              schemaPreview={db.schemas[db.active]}
+              autoSyncFromSchema
+              defaultSQL={
+                `-- 示例：按部门编号统计人数与平均年龄（无 JOIN 版）\n` +
+                `SELECT dept_id AS dept, COUNT(*) AS cnt, AVG(age) AS avg_age\n` +
+                `FROM people\n` +
+                `GROUP BY dept_id\n` +
+                `ORDER BY cnt DESC;`
+              }
+            />
+          </div>
+          <div className="panel" style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', minHeight: 560 }}>
+            <ResultTable result={result} minHeight={560} minRows={10} rowHeight={32} />
+          </div>
         </div>
-        <div className="panel" style={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 560 }}>
-          <ResultTable result={result} title="SampleDB：结果" />
-        </div>
-      </div>
 
       <div style={{ marginTop: 12 }}>
         <h3 style={{ margin: '8px 0' }}>浏览 people / dept</h3>

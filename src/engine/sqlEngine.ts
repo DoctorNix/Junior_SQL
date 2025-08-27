@@ -1,31 +1,71 @@
-import type { Database, QueryResult, Schema, Column, ColType, Row } from './types.ts';
+import type { Database, QueryResult, Schema, Column, ColType, Row } from './types';
 
 // --------------------------------------------------
 // Public API
-// NOTE: Current SELECT subset supports WHERE, GROUP BY, ORDER BY, LIMIT.
-// JOIN and HAVING are intentionally not supported (planned upgrade).
+// NOTE: Current SELECT subset supports WHERE, GROUP BY, HAVING (alias-based), ORDER BY, LIMIT.
+// JOIN is not supported yet (planned upgrade). HAVING supports conditions on SELECT aliases or GROUP BY columns.
+// Added: DELETE (with FK actions: RESTRICT / CASCADE / SET NULL) and CREATE VIEW (materialized).
 // --------------------------------------------------
 export function runSQL(sql: string, db: Database, setDB: (next: Database) => void): QueryResult {
   const cleaned = stripComments(sql || '').trim();
   if (!cleaned) return emptyResult('Empty SQL');
 
+  // DROP TABLE [IF EXISTS] table
+  const dropMatch = cleaned.match(/^DROP\s+TABLE\s+(IF\s+EXISTS\s+)?(\w+)\s*;?$/i);
+  if (dropMatch) {
+    const ifExists = !!dropMatch[1];
+    const table = dropMatch[2];
+    const exists = !!db.schemas[table];
+    if (!exists) {
+      if (ifExists) return msgResult(`Table ${table} does not exist — skipped.`);
+      throw new Error('Unknown table: ' + table);
+    }
+
+    // Prevent dropping if referenced by FKs in other tables (schema-level check)
+    const refs = listChildFKs(db, table);
+    if (refs.length) {
+      const by = refs.map(r => r.childTable).join(', ');
+      throw new Error(`Cannot DROP TABLE ${table}: referenced by foreign keys in [${by}]`);
+    }
+
+    const nextSchemas = { ...db.schemas } as Record<string, Schema>;
+    const nextRows = { ...db.rows } as Record<string, Row[]>;
+    delete nextSchemas[table];
+    delete nextRows[table];
+    const nextActive = db.active === table ? Object.keys(nextSchemas)[0] || '' : db.active;
+    setDB({ ...db, active: nextActive, schemas: nextSchemas, rows: nextRows });
+    return msgResult(`Dropped table ${table}.`);
+  }
+
   // Allow multiple CREATE TABLE statements separated by semicolons
   if (/^CREATE\s+TABLE/i.test(cleaned)) {
-    const schemas = parseCreates(cleaned);
-    const next: Database = {
-      active: db.active,
-      schemas: { ...db.schemas },
-      rows: { ...db.rows },
-    };
+    const parsed = parseCreates(cleaned);
+    const next: Database = { active: db.active, schemas: { ...db.schemas }, rows: { ...db.rows } };
+    let created = 0;
     let last = db.active;
-    for (const sc of schemas) {
+    for (const sc of parsed) {
+      const exists = !!next.schemas[sc.tableName];
+      const wantIfNotExists = !!(sc as any).meta?.createdWithIfNotExists;
+      if (exists && wantIfNotExists) {
+        // skip silently (or collect message if needed)
+        continue;
+      }
+      if (exists && !wantIfNotExists) {
+        throw new Error(`Table ${sc.tableName} already exists`);
+      }
       next.schemas[sc.tableName] = sc;
       if (!next.rows[sc.tableName]) next.rows[sc.tableName] = [];
       last = sc.tableName;
+      created++;
     }
-    next.active = last;
-    setDB(next);
-    return msgResult(`Created ${schemas.length} table(s). Active: ${last}`);
+    if (created > 0) {
+      next.active = last;
+      setDB(next);
+      return msgResult(`Created ${created} table(s). Active: ${last}`);
+    } else {
+      // nothing created (all skipped by IF NOT EXISTS)
+      return msgResult('No table created (all existed).');
+    }
   }
 
   // CREATE VIEW view_name AS <select>
@@ -84,7 +124,17 @@ export function runSQL(sql: string, db: Database, setDB: (next: Database) => voi
       inserted.push(castRowTypes(row, schema));
     }
 
-    const next: Database = { ...db, rows: { ...db.rows, [tbl]: [...(db.rows[tbl] || []), ...inserted] } };
+    // Constraint checks: stage rows in a temp buffer, then commit
+    const current = db.rows[tbl] || [];
+    const staged: Row[] = [...current];
+    for (const r of inserted) {
+      ensurePKUnique(db.schemas[tbl], staged, r);
+      ensureUniqueKeys(db.schemas[tbl], staged, r);
+      ensureFKs(db, db.schemas[tbl], r);
+      staged.push(r);
+    }
+
+    const next: Database = { ...db, rows: { ...db.rows, [tbl]: staged } };
     setDB(next);
 
     // Return a concise message for batch, or the single row echo when only one
@@ -98,8 +148,10 @@ export function runSQL(sql: string, db: Database, setDB: (next: Database) => voi
   if (/^UPDATE\s+/i.test(cleaned)) {
     return updateQuery(cleaned, db, setDB);
   }
-    
-  if (!/^SELECT\s+/i.test(cleaned)) throw new Error('Supported statements: CREATE / INSERT / SELECT / UPDATE / CREATE VIEW');
+  if (/^DELETE\s+/i.test(cleaned)) {
+    return deleteQuery(cleaned, db, setDB);
+  }
+  if (!/^SELECT\s+/i.test(cleaned)) throw new Error('Supported statements: CREATE / INSERT / SELECT / UPDATE / DELETE / CREATE VIEW');
 
   return selectQuery(cleaned, db);
 }
@@ -139,10 +191,9 @@ export function selectQuery(sql: string, db: Database): QueryResult {
   const groupMatch = tail.match(/\s+GROUP\s+BY\s+([\s\S]*?)(?=\s+HAVING|\s+ORDER\s+BY|\s+LIMIT|$)/i);
   if (groupMatch) groupCols = splitComma(groupMatch[1]);
 
-  // 明确不支持 HAVING
-  if (/\s+HAVING\s+/i.test(tail)) {
-    throw new Error('HAVING is not supported yet (coming soon)');
-  }
+  // HAVING (limit: only supports referencing SELECT aliases or GROUP BY columns)
+  const havingMatch = tail.match(/\s+HAVING\s+([\s\S]*?)(?=\s+ORDER\s+BY|\s+LIMIT|$)/i);
+  const havingExpr = havingMatch ? havingMatch[1].trim() : null;
 
   // 解析 SELECT 列
   const selectItems = splitComma(selectPart);
@@ -171,6 +222,11 @@ export function selectQuery(sql: string, db: Database): QueryResult {
           // (If needed later, we can expand from representative row.)
         }
       });
+      // Apply HAVING on the aggregated row (supports alias-based conditions)
+      if (havingExpr) {
+        const keep = evalBoolExpr(havingExpr, out);
+        if (!keep) continue;
+      }
       projected.push(out);
     }
   } else {
@@ -201,7 +257,13 @@ export function selectQuery(sql: string, db: Database): QueryResult {
         if (sel.kind === 'agg') out[sel.alias] = computeAgg(sel.fn, sel.arg, rows);
         else if (sel.kind === 'col') out[sel.alias] = projected[0]?.[sel.alias] ?? null;
       });
-      projected = [out];
+      // Apply HAVING if present (alias-based only)
+      if (havingExpr) {
+        const keep = evalBoolExpr(havingExpr, out);
+        projected = keep ? [out] : [];
+      } else {
+        projected = [out];
+      }
     }
   }
 
@@ -216,16 +278,23 @@ export function selectQuery(sql: string, db: Database): QueryResult {
     });
   }
 
-  // ORDER BY
+  // ORDER BY (supports ordering by aliases; also fallback to baseAlias.<col> when using SELECT *)
   const orderMatch = tail.match(/\s+ORDER\s+BY\s+([\s\S]*?)(?=\s+LIMIT|$)/i);
   if (orderMatch) {
     const items = splitComma(orderMatch[1]).map(x => {
       const mm = x.match(/^(\S+)(?:\s+(ASC|DESC))?$/i);
-      return { col: mm ? mm[1] : x, dir: (mm?.[2] || 'ASC').toUpperCase() };
+      return { col: mm ? mm[1] : x, dir: (mm?.[2] || 'ASC').toUpperCase() } as { col: string; dir: 'ASC'|'DESC' };
     });
-    projected.sort((a,b) => {
+    const resolveOrderVal = (row: Row, key: string) => {
+      if (key in row) return (row as any)[key];
+      // For SELECT * (non-grouped) we expand as `${alias}.${col}` keys; try a fallback
+      if (baseAlias && ((baseAlias + '.' + key) in (row as any))) return (row as any)[baseAlias + '.' + key];
+      return (row as any)[key];
+    };
+    projected.sort((a, b) => {
       for (const it of items) {
-        const av = a[it.col]; const bv = b[it.col];
+        const av = resolveOrderVal(a as any, it.col);
+        const bv = resolveOrderVal(b as any, it.col);
         if (av == bv) continue; // eslint-disable-line eqeqeq
         const cmp = av > bv ? 1 : -1;
         return it.dir === 'DESC' ? -cmp : cmp;
@@ -289,13 +358,180 @@ export function updateQuery(sql: string, db: Database, setDB: (next: Database) =
       const newVal = evalSetExpr(a.expr, rowWrapper);
       next[a.col] = newVal;
     }
+    const casted = castRowTypes(next, schema);
+    ensurePKUniqueOnUpdate(schema, rows, orig, casted);
+    ensureUniqueKeysOnUpdate(schema, rows, orig, casted);
+    ensureFKs(db, schema, casted);
     affected++;
-    return castRowTypes(next, schema);
+    return casted;
   });
 
   const nextDB: Database = { ...db, rows: { ...db.rows, [table]: newRows } };
-  setDB(nextDB);
-  return { columns: ['message', 'affected'], rows: [{ message: `Updated ${affected} row(s) in ${table}.`, affected }] };
+  // Defer setDB/return if there are FK onUpdate actions to propagate
+  const childFKs = listChildFKs(db, table);
+  if (!childFKs.length) {
+    setDB(nextDB);
+    return { columns: ['message', 'affected'], rows: [{ message: `Updated ${affected} row(s) in ${table}.`, affected }] };
+  }
+  // Propagate ON UPDATE actions if this table is referenced by children
+  // Build maps from oldKey -> newKey for rows whose referenced key changed per FK
+  const changesPerFk = childFKs.map(({ fk }) => ({ fk, map: new Map<string, string>() }));
+  for (let i = 0; i < rows.length; i++) {
+    const oldR = rows[i];
+    const newR = newRows[i];
+    for (const ch of changesPerFk) {
+      const { fk, map } = ch as any;
+      // Only consider changes on referenced columns
+      const refOldProbe: Row = {}; const refNewProbe: Row = {};
+      fk.refCols.forEach((c: string) => { refOldProbe[c] = oldR[c]; refNewProbe[c] = newR[c]; });
+      const oldKey = tupleKey(fk.refCols, refOldProbe);
+      const newKey = tupleKey(fk.refCols, refNewProbe);
+      if (oldKey !== newKey) map.set(oldKey, newKey);
+    }
+  }
+  // Apply per child table
+  const nextRowsAfterUpdate: Record<string, Row[]> = { ...db.rows, [table]: newRows };
+  for (const { childTable, childSchema, fk } of childFKs) {
+    const pair = changesPerFk.find(x => x.fk === fk) as any;
+    const changeMap: Map<string, string> = pair?.map || new Map();
+    if (changeMap.size === 0) continue;
+    const childAll = nextRowsAfterUpdate[childTable] || [];
+    const updated: Row[] = [];
+    for (const ch of childAll) {
+      const probe: Row = {};
+      fk.cols.forEach((c: string, i: number) => { probe[fk.refCols[i]] = ch[c]; });
+      const childKey = tupleKey(fk.refCols, probe);
+      if (!changeMap.has(childKey)) { updated.push(ch); continue; }
+      const action = fk.onUpdate || 'RESTRICT';
+      if (action === 'RESTRICT') {
+        throw new Error(`UPDATE restricted by FK: ${childTable}(${fk.cols.join(',')}) -> ${table}(${fk.refCols.join(',')})`);
+      } else if (action === 'SET_NULL') {
+        const nr: Row = { ...ch };
+        fk.cols.forEach((c: string) => { nr[c] = null; });
+        updated.push(nr);
+      } else if (action === 'CASCADE') {
+        const newKey = changeMap.get(childKey)!; // string like JSON of array
+        // We need to map back to values; since tupleKey uses JSON.stringify, parse it
+        const vals = JSON.parse(newKey);
+        const nr: Row = { ...ch };
+        fk.cols.forEach((c: string, i: number) => { nr[c] = vals[i]; });
+        updated.push(nr);
+      }
+    }
+    nextRowsAfterUpdate[childTable] = updated;
+  }
+  const nextDB2: Database = { ...db, rows: nextRowsAfterUpdate };
+  setDB(nextDB2);
+  return { columns: ['message', 'affected'], rows: [{ message: `Updated ${affected} row(s) in ${table}. (propagated FK actions)`, affected }] };
+}
+
+// --------------------------------------------------
+// DELETE FROM parsing with FK actions
+// --------------------------------------------------
+
+export function deleteQuery(sql: string, db: Database, setDB: (next: Database) => void): QueryResult {
+  const s = stripComments(sql).replace(/;\s*$/, '').trim();
+  const m = s.match(/^DELETE\s+FROM\s+(\w+)(?:\s+WHERE\s+([\s\S]+))?$/i);
+  if (!m) throw new Error('Malformed DELETE. Expected: DELETE FROM table [WHERE expr]');
+  const table = m[1];
+  const where = m[2]?.trim();
+
+  const { schema, rows } = getTableRows(table, db);
+
+  // mark rows to delete
+  const toDeleteIdx: number[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const rwrap: any = { [table]: rows[i] };
+    const hit = where ? evalBoolExpr(where, rwrap) : true;
+    if (hit) toDeleteIdx.push(i);
+  }
+  if (toDeleteIdx.length === 0) {
+    return { columns: ['message', 'affected'], rows: [{ message: `Deleted 0 row(s) from ${table}.`, affected: 0 }] };
+  }
+
+  // Build new DB rows map we will mutate
+  const nextRows: Record<string, Row[]> = { ...db.rows };
+
+  // Gather concrete rows to delete from parent table
+  const parentRows = rows.filter((_, idx) => toDeleteIdx.includes(idx));
+
+  // Apply cascading to children recursively
+  const visited = new Set<string>(); // key as table|idx to avoid double-delete
+  function cascadeFrom(parentTable: string, parentSchema: Schema, doomedRows: Row[]) {
+    // 1) For each child FK referencing parentTable
+    const childFKs = listChildFKs(db, parentTable);
+    for (const { childTable, childSchema, fk } of childFKs) {
+      const childAll = nextRows[childTable] || [];
+      // Build a set of parent keys for this fk (based on fk.refCols ordering)
+      const parentKeySet = new Set<string>();
+      for (const pr of doomedRows) {
+        const probe: Row = {};
+        fk.refCols.forEach((c, i) => { probe[c] = pr[c]; });
+        parentKeySet.add(tupleKey(fk.refCols, probe));
+      }
+
+      // Scan child rows and classify matches
+      const toNullIdx: number[] = [];
+      const toDelIdx: number[] = [];
+      for (let i = 0; i < childAll.length; i++) {
+        const ch = childAll[i];
+        const chKeyProbe: Row = {};
+        fk.cols.forEach((c, j) => { chKeyProbe[fk.refCols[j]] = ch[c]; });
+        const match = parentKeySet.has(tupleKey(fk.refCols, chKeyProbe));
+        if (!match) continue;
+        if (fk.onDelete === 'RESTRICT' || !fk.onDelete) {
+          throw new Error(`DELETE restricted by FK: ${childTable}(${fk.cols.join(',')}) -> ${parentTable}(${fk.refCols.join(',')})`);
+        } else if (fk.onDelete === 'CASCADE') {
+          toDelIdx.push(i);
+        } else if (fk.onDelete === 'SET_NULL') {
+          toNullIdx.push(i);
+        }
+      }
+
+      // Apply SET NULL
+      if (toNullIdx.length) {
+        const newChild = childAll.map((r, idx) => {
+          if (!toNullIdx.includes(idx)) return r;
+          const nr: Row = { ...r };
+          fk.cols.forEach(c => { nr[c] = null; });
+          return nr;
+        });
+        nextRows[childTable] = newChild;
+      }
+
+      // Apply CASCADE (delete) and recurse further for their own children
+      if (toDelIdx.length) {
+        const newChild = childAll.filter((_, idx) => !toDelIdx.includes(idx));
+        const doomedChildren = childAll.filter((_, idx) => toDelIdx.includes(idx));
+        nextRows[childTable] = newChild;
+        if (doomedChildren.length) {
+          cascadeFrom(childTable, childSchema, doomedChildren);
+        }
+      }
+    }
+  }
+
+  cascadeFrom(table, schema, parentRows);
+
+  // Finally, delete from parent table
+  nextRows[table] = rows.filter((_, idx) => !toDeleteIdx.includes(idx));
+
+  const affected = toDeleteIdx.length;
+  const next: Database = { ...db, rows: nextRows };
+  setDB(next);
+  return { columns: ['message', 'affected'], rows: [{ message: `Deleted ${affected} row(s) from ${table}.`, affected }] };
+}
+
+function listChildFKs(db: Database, parentTable: string): { childTable: string; childSchema: Schema; fk: { cols: string[]; refTable: string; refCols: string[]; onDelete?: 'RESTRICT'|'CASCADE'|'SET_NULL'; onUpdate?: 'RESTRICT'|'CASCADE'|'SET_NULL'; } }[] {
+  const out: { childTable: string; childSchema: Schema; fk: any }[] = [];
+  for (const [t, sc] of Object.entries(db.schemas)) {
+    const fks = (sc as any).foreignKeys as any[] | undefined;
+    if (!fks || !fks.length) continue;
+    for (const fk of fks) {
+      if (fk.refTable === parentTable) out.push({ childTable: t, childSchema: sc, fk });
+    }
+  }
+  return out;
 }
 
 // --------------------------------------------------
@@ -317,53 +553,137 @@ function parseCreates(sql: string): Schema[] {
 function parseCreate(sql: string): Schema | null {
   try {
     const s = sql.trim().replace(/\s+/g, ' ').replace(/;$/, '');
-    const m = s.match(/^CREATE TABLE (\w+) \((.*)\)$/i);
+    const m = s.match(/^CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\((.*)\)$/i);
     if (!m) return null;
-    const tableName = m[1];
-    const inner = m[2];
+    const hasIfNotExists = !!m[1];
+    const tableName = m[2];
+    const inner = m[3];
+
     const parts = splitComma(inner);
-    // 替换原先的 columns 解析
-    const columns: Column[] = parts.map(p => {
-    // allow: INT/INTEGER, REAL, TEXT, BOOLEAN, CHAR(n), VARCHAR(n), DECIMAL(p,s)
-    const m = p.match(/^(\w+)\s+([A-Z]+)(?:\s*\(([^)]+)\))?(.*)$/i);
-    if (!m) throw new Error('Unsupported column syntax: ' + p);
 
-    const name = m[1];
-    let rawType = m[2].toUpperCase();
-    const paramStr = (m[3] || '').trim();
-    const rest = (m[4] || '').toUpperCase();
-    const primary = /PRIMARY\s+KEY/.test(rest);
+    const columns: Column[] = [];
+    const primaryKey: string[] = [];
+    const uniqueKeys: { columns: string[]; name?: string }[] = [];
+    const foreignKeys: { cols: string[]; refTable: string; refCols: string[]; onDelete?: 'RESTRICT'|'CASCADE'|'SET_NULL'; onUpdate?: 'RESTRICT'|'CASCADE'|'SET_NULL'; }[] = [];
 
-    // normalize aliases
-    if (rawType === 'INTEGER') rawType = 'INT';
-    if (rawType === 'DEC' || rawType === 'NUMERIC') rawType = 'DECIMAL';
+    for (const pRaw of parts) {
+      const p = pRaw.trim();
 
-    const col: Column = {
+      // Table-level PRIMARY KEY (a, b)
+      if (/^PRIMARY\s+KEY\s*\(/i.test(p)) {
+        const cols = p.match(/\(([^)]+)\)/)![1].split(',').map(s => s.trim());
+        primaryKey.push(...cols);
+        continue;
+      }
+
+      // Table-level UNIQUE (a, b) — allow optional CONSTRAINT name
+      const um = p.match(/^(?:CONSTRAINT\s+(\w+)\s+)?UNIQUE\s*\(([^)]+)\)/i);
+      if (um) {
+        const name = um[1] || undefined;
+        const cols = um[2].split(',').map(s => s.trim());
+        uniqueKeys.push({ columns: cols, name });
+        continue;
+      }
+
+      // Table-level FOREIGN KEY (... ) REFERENCES tbl(...)[ ON DELETE ...][ ON UPDATE ...]
+      if (/^(CONSTRAINT\s+\w+\s+)?FOREIGN\s+KEY\s*\(/i.test(p)) {
+        const cols = p.match(/FOREIGN\s+KEY\s*\(([^)]+)\)/i)![1].split(',').map(s => s.trim());
+        const ref = p.match(/REFERENCES\s+(\w+)\s*\(([^)]+)\)/i);
+        if (!ref) throw new Error('FOREIGN KEY needs REFERENCES table(cols)');
+        const refTable = ref[1];
+        const refCols = ref[2].split(',').map(s => s.trim());
+        const del = p.match(/ON\s+DELETE\s+(CASCADE|RESTRICT|SET\s+NULL)/i)?.[1];
+        const upd = p.match(/ON\s+UPDATE\s+(CASCADE|RESTRICT|SET\s+NULL)/i)?.[1];
+        const norm = (x?: string) => x ? x.replace(/\s+/g,'_').toUpperCase() as 'CASCADE'|'RESTRICT'|'SET_NULL' : undefined;
+        foreignKeys.push({ cols, refTable, refCols, onDelete: norm(del), onUpdate: norm(upd) });
+        continue;
+      }
+
+      // Column definition
+      const cm = p.match(/^(\w+)\s+([A-Z]+)(?:\s*\(([^)]+)\))?(.*)$/i);
+      if (!cm) throw new Error('Unsupported column syntax: ' + p);
+
+      const name = cm[1];
+      let rawType = cm[2].toUpperCase();
+      const paramStr = (cm[3] || '').trim();
+      const rest = (cm[4] || '').toUpperCase();
+      const primary = /PRIMARY\s+KEY/.test(rest);
+
+      // normalize aliases
+      if (rawType === 'INTEGER') rawType = 'INT';
+      if (rawType === 'DEC' || rawType === 'NUMERIC') rawType = 'DECIMAL';
+      if (rawType === 'FLOAT' || rawType === 'DOUBLE') rawType = 'REAL';
+
+      const col: Column = {
         id: name + '_' + Math.random().toString(36).slice(2,6),
         name,
         type: rawType as ColType,
         primary,
-    };
+      } as Column;
 
-    if (rawType === 'CHAR' || rawType === 'VARCHAR') {
+      if (rawType === 'CHAR' || rawType === 'VARCHAR') {
         const n = paramStr ? parseInt(paramStr, 10) : NaN;
         if (!Number.isFinite(n)) throw new Error(`${rawType} requires length, e.g. ${rawType}(20)`);
-        col.length = n;
-    } else if (rawType === 'DECIMAL') {
+        (col as any).length = n;
+      } else if (rawType === 'DECIMAL') {
         const ps = paramStr.split(',').map(s => parseInt(s.trim(), 10));
         if (!(ps.length === 2 && ps.every(n => Number.isFinite(n))))
-        throw new Error('DECIMAL requires (precision, scale), e.g. DECIMAL(10,2)');
-        col.precision = ps[0];
-        col.scale = ps[1];
-    } else if (rawType === 'INT' || rawType === 'REAL' || rawType === 'TEXT' || rawType === 'BOOLEAN') {
+          throw new Error('DECIMAL requires (precision, scale), e.g. DECIMAL(10,2)');
+        (col as any).precision = ps[0];
+        (col as any).scale = ps[1];
+      } else if (rawType === 'INT' || rawType === 'REAL' || rawType === 'TEXT' || rawType === 'BOOLEAN') {
         // no params
-    } else {
+      } else {
         throw new Error('Unsupported type: ' + rawType);
+      }
+
+      // Column-level UNIQUE
+      if (/\bUNIQUE\b/.test(rest)) {
+        uniqueKeys.push({ columns: [name] });
+      }
+
+      columns.push(col);
     }
 
-    return col;
-});
-    return { tableName, columns };
+    const schema: Schema = { tableName, columns } as Schema;
+    if (primaryKey.length) schema.primaryKey = primaryKey;
+    if (uniqueKeys.length) schema.uniqueKeys = uniqueKeys;
+    if (foreignKeys.length) (schema as any).foreignKeys = foreignKeys;
+
+    // Column-level PRIMARY flags -> primaryKey (single or composite when specified via table-level earlier)
+    if (!schema.primaryKey) {
+      const pkCols = columns.filter(c => (c as any).primary).map(c => c.name);
+      if (pkCols.length >= 1) schema.primaryKey = pkCols;
+    }
+
+    // Auto PK injection/selection when still missing
+    const meta: any = { createdWithIfNotExists: hasIfNotExists };
+    if (!schema.primaryKey || schema.primaryKey.length === 0) {
+      // Prefer existing column named 'id'
+      const idCol = columns.find(c => c.name.toLowerCase() === 'id');
+      if (idCol) {
+        schema.primaryKey = [idCol.name];
+        (idCol as any).primary = true;
+        meta.autoPrimaryKey = { column: idCol.name, created: false, autoincrement: (idCol.type === 'INT' || idCol.type === 'INTEGER') };
+      } else {
+        // Inject synthetic id INT AUTOINCREMENT-like
+        const newCol: Column = {
+          id: 'id_' + Math.random().toString(36).slice(2,6),
+          name: 'id',
+          type: 'INT' as ColType,
+          primary: true,
+        } as any;
+        (newCol as any).autoIncrement = true;
+        columns.unshift(newCol);
+        schema.primaryKey = ['id'];
+        meta.autoPrimaryKey = { column: 'id', created: true, autoincrement: true };
+      }
+    }
+
+    // Attach meta options
+    (schema as any).meta = meta;
+
+    return schema;
   } catch {
     return null;
   }
@@ -548,10 +868,17 @@ function evalBoolExpr(expr: string, row: any): boolean {
 // --------------------------------------------------
 
 function stripComments(input: string): string {
-  // Remove line comments starting with -- and block comments /* ... */
-  return input
-    .replace(/--.*$/gm, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '');
+  // Remove block comments first
+  const noBlock = input.replace(/\/\*[\s\S]*?\*\//g, '');
+  // Remove full-line comments that start with common markers (after optional whitespace):
+  // --, //, #, and full-width em dashes (— or ——)
+  const noFullLine = noBlock
+    .split(/\r?\n/)
+    .map(line => (/^\s*(--|\/\/|#|—{1,2})/.test(line) ? '' : line))
+    .join('\n');
+  // Also strip trailing `-- ...` comments at end of code lines (best-effort; may affect strings but fine for our teaching scope)
+  const noTrail = noFullLine.replace(/--.*$/gm, '');
+  return noTrail;
 }
 
 function getTableRows(name: string, db: Database) {
@@ -783,4 +1110,93 @@ function inferTypeFromValues(values: any[]): ColType {
   }
   // default to TEXT (covers strings/mixed)
   return 'TEXT';
+}
+
+// --------------------------------------------------
+// Constraint helpers (PK / UNIQUE / FK)
+// --------------------------------------------------
+function tupleKey(cols: string[], obj: Row) {
+  return JSON.stringify(cols.map(c => obj[c] ?? null));
+}
+
+function ensurePKUnique(schema: Schema, existing: Row[], newRow: Row) {
+  const pk = (schema as any).primaryKey as string[] | undefined;
+  if (!pk || !pk.length) return;
+  if (pk.some(c => newRow[c] === null || newRow[c] === undefined))
+    throw new Error(`Primary key cannot be NULL: (${pk.join(', ')})`);
+  const key = tupleKey(pk, newRow);
+  const dup = existing.some(r => tupleKey(pk, r) === key);
+  if (dup) throw new Error(`Duplicate primary key (${pk.join(', ')}): ${key}`);
+}
+
+function ensurePKUniqueOnUpdate(schema: Schema, allRows: Row[], oldRow: Row, newRow: Row) {
+  const pk = (schema as any).primaryKey as string[] | undefined;
+  if (!pk || !pk.length) return;
+  if (pk.some(c => newRow[c] === null || newRow[c] === undefined))
+    throw new Error(`Primary key cannot be NULL: (${pk.join(', ')})`);
+  const oldKey = tupleKey(pk, oldRow);
+  const newKey = tupleKey(pk, newRow);
+  if (newKey === oldKey) return;
+  const dup = allRows.some(r => tupleKey(pk, r) === newKey);
+  if (dup) throw new Error(`Duplicate primary key on update: ${newKey}`);
+}
+
+function ensureUniqueKeys(schema: Schema, existing: Row[], newRow: Row) {
+  const uks = readUniqueSets(schema);
+  for (const uk of uks) {
+    const hasNull = uk.some(c => newRow[c] === null || newRow[c] === undefined);
+    if (hasNull) continue;
+    const key = tupleKey(uk, newRow);
+    const hit = existing.some(r => {
+      const nullInR = uk.some(c => r[c] === null || r[c] === undefined);
+      if (nullInR) return false;
+      return tupleKey(uk, r) === key;
+    });
+    if (hit) throw new Error(`Unique constraint violated on (${uk.join(', ')})`);
+  }
+}
+
+function ensureUniqueKeysOnUpdate(schema: Schema, allRows: Row[], oldRow: Row, newRow: Row) {
+  const uks = readUniqueSets(schema);
+  for (const uk of uks) {
+    const hasNullNew = uk.some(c => newRow[c] === null || newRow[c] === undefined);
+    if (hasNullNew) continue;
+    const oldKey = tupleKey(uk, oldRow);
+    const newKey = tupleKey(uk, newRow);
+    if (newKey === oldKey) continue;
+    const hit = allRows.some(r => {
+      const nullInR = uk.some(c => r[c] === null || r[c] === undefined);
+      if (nullInR) return false;
+      return tupleKey(uk, r) === newKey;
+    });
+    if (hit) throw new Error(`Unique constraint violated on update (${uk.join(', ')})`);
+  }
+}
+
+function readUniqueSets(schema: Schema): string[][] {
+  const raw: any = (schema as any).uniqueKeys;
+  if (!raw) return [];
+  if (Array.isArray(raw) && raw.length > 0) {
+    if (Array.isArray(raw[0])) return raw as string[][]; // legacy form
+    return (raw as any[]).map(u => (u && Array.isArray(u.columns) ? u.columns : []));
+  }
+  return [];
+}
+
+function fkSatisfied(db: Database, fk: { cols: string[]; refTable: string; refCols: string[] }, row: Row) {
+  if (fk.cols.some(c => row[c] === null || row[c] === undefined)) return true; // nullable FK allowed
+  const refRows = db.rows[fk.refTable] || [];
+  const probe: Row = {};
+  fk.refCols.forEach((c, i) => { probe[c] = row[fk.cols[i]]; });
+  const key = tupleKey(fk.refCols, probe);
+  return refRows.some(r => tupleKey(fk.refCols, r) === key);
+}
+
+function ensureFKs(db: Database, schema: Schema, newRow: Row) {
+  const fks = (schema as any).foreignKeys as { cols: string[]; refTable: string; refCols: string[] }[] | undefined;
+  for (const fk of fks || []) {
+    if (!fkSatisfied(db, fk, newRow)) {
+      throw new Error(`Foreign key fails: (${fk.cols.join(', ')}) -> ${fk.refTable}(${fk.refCols.join(', ')})`);
+    }
+  }
 }

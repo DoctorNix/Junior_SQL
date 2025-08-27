@@ -31,3 +31,29 @@ export function formatCell(v: any) {
   if (s.length > 150) s = s.slice(0, 147) + '...';
   return s;
 }
+
+// Check if a value is numeric
+export function isNumeric(val: any): boolean {
+  return typeof val === 'number' && !isNaN(val);
+}
+
+// Convert SQL data type to display-friendly label
+export function typeLabel(sqlType: string): string {
+  const t = sqlType.toUpperCase();
+  if (['INT', 'INTEGER', 'BIGINT', 'SMALLINT'].includes(t)) return 'Integer';
+  if (['REAL', 'FLOAT', 'DOUBLE'].includes(t)) return 'Float';
+  if (['CHAR', 'VARCHAR', 'TEXT'].includes(t)) return 'Text';
+  if (['BOOLEAN', 'BOOL'].includes(t)) return 'Boolean';
+  if (['DATE', 'DATETIME', 'TIMESTAMP'].includes(t)) return 'Date/Time';
+  return t;
+}
+
+// Join multiple SQL column definitions into a CREATE TABLE snippet
+export function joinColumnDefs(columns: { name: string; type: string; constraints?: string[] }[]): string {
+  return columns
+    .map(c => {
+      const cons = c.constraints && c.constraints.length > 0 ? ' ' + c.constraints.join(' ') : '';
+      return `${c.name} ${c.type}${cons}`;
+    })
+    .join(', ');
+}
