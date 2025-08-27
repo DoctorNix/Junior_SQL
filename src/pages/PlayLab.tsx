@@ -109,14 +109,14 @@ export default function PlayLab() {
         <div style={{ fontSize: 14, lineHeight: 1.6 }}>
           <ol style={{ margin: 0, paddingLeft: 18 }}>
             <li>
-              <strong>模块一：创造 Table（左上）</strong> – 在左侧编辑表名/列并点击「应用到数据库」。
+              <strong>1：创造 Table（左上）</strong> – 在左侧编辑表名/列并点击「应用到数据库」。
               创建成功后，该表将成为当前 <em>活动表</em>（Active）。
             </li>
             <li>
-              <strong>模块二：当前表数据（右上）</strong> – 通过右上角下拉切换活动表，实时查看该表的行数据。
+              <strong>2：当前表数据（右上）</strong> – 通过右上角下拉切换活动表，实时查看该表的行数据。
             </li>
             <li>
-              <strong>模块三：Query 空间（左下）</strong> – 编写/粘贴 SQL 并点击「▶ 运行」。
+              <strong>3：Query 空间（左下）</strong> – 编写/粘贴 SQL 并点击「▶ 运行」。
               支持 <code>CREATE</code> / <code>INSERT</code> / <code>SELECT</code> / <code>UPDATE</code> / <code>DELETE</code> / <code>DROP TABLE IF EXISTS</code> / <code>CREATE VIEW</code> 等子集。
               <div style={{ marginTop: 4, fontSize: 12, color: '#64748b' }}>
                 快捷键：<kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>Enter</kbd> 运行；支持注释 <code>--</code>、<code>//</code>、<code>#</code> 与块注释 <code>/* ... */</code>。
